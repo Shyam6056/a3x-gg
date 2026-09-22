@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { CareGoal, CareRole, CareRound } from "./playbooks";
+import { fetchMine, markDebriefSentRemote, pushCommitment, pushDebrief, pushReport } from "./sync";
 
 export interface DailyCommitment {
   date: string;
@@ -76,7 +77,7 @@ const dayKey = () => new Date().toISOString().slice(0, 10);
 
 export const useMovementCare = create<MovementCareStore>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       commitment: null,
       reports: [],
       debriefs: [],
@@ -99,6 +100,7 @@ export const useMovementCare = create<MovementCareStore>()(
           committedAt: new Date().toISOString(),
         };
         set({ commitment });
+        void pushCommitment(commitment);
         return commitment;
       },
       report: (input) => {
@@ -109,6 +111,7 @@ export const useMovementCare = create<MovementCareStore>()(
           reportedAt: new Date().toISOString(),
         };
         set((state) => ({ reports: [report, ...state.reports].slice(0, 90) }));
+        void pushReport(report);
         return report;
       },
       saveDebrief: (input) => {
@@ -120,14 +123,20 @@ export const useMovementCare = create<MovementCareStore>()(
           createdAt: new Date().toISOString(),
         };
         set((state) => ({ debriefs: [debrief, ...state.debriefs].slice(0, 200) }));
+        void pushDebrief(debrief);
         return debrief;
       },
-      markDebriefSent: (id) =>
+      markDebriefSent: (id) => {
         set((state) => ({
           debriefs: state.debriefs.map((item) => (item.id === id ? { ...item, sentOnWhatsapp: true } : item)),
-        })),
-      setClosingProperties: (ids) =>
-        set((state) => ({ commitment: state.commitment ? { ...state.commitment, closingPropertyIds: ids } : null })),
+        }));
+        void markDebriefSentRemote(id);
+      },
+      setClosingProperties: (ids) => {
+        set((state) => ({ commitment: state.commitment ? { ...state.commitment, closingPropertyIds: ids } : null }));
+        const c = get().commitment;
+        if (c) void pushCommitment(c);
+      },
       setManualMode: (on) => set({ manualMode: on }),
       setManualSize: (size) => set({ manualSize: Math.max(1, Math.min(200, Math.round(size) || 1)) }),
       setManualList: (ulids) => set({ manualList: Array.from(new Set(ulids)) }),
@@ -144,10 +153,37 @@ export const useMovementCare = create<MovementCareStore>()(
       clearManual: () => set({ manualList: [] }),
       clearCommitment: () => set({ commitment: null }),
     }),
-    { name: "gharpayy.movement-care.v3" },
+    {
+      name: "gharpayy.movement-care.v3",
+      // After the local copy loads, pull the server copy so a second device / cleared
+      // browser shows the same commitment, reports and debriefs.
+      onRehydrateStorage: () => () => {
+        if (typeof window !== "undefined") queueMicrotask(() => void hydrateFromServer());
+      },
+    },
   ),
 );
 
 export function todaysCommitment(commitment: DailyCommitment | null) {
   return commitment?.date === dayKey() ? commitment : null;
+}
+
+/** Merge server rows into the local store (union by id; newest commitment wins). */
+export async function hydrateFromServer() {
+  const remote = await fetchMine();
+  if (!remote) return;
+  useMovementCare.setState((state) => {
+    const byId = <T extends { id: string }>(local: T[], incoming: T[], stamp: (x: T) => string, cap: number) => {
+      const map = new Map<string, T>();
+      for (const x of [...incoming, ...local]) map.set(x.id, { ...map.get(x.id), ...x } as T);
+      return [...map.values()].sort((a, b) => stamp(b).localeCompare(stamp(a))).slice(0, cap);
+    };
+    const local = todaysCommitment(state.commitment);
+    const useRemote = remote.commitment && (!local || remote.commitment.committedAt > local.committedAt);
+    return {
+      commitment: useRemote ? remote.commitment : state.commitment,
+      reports: byId(state.reports, remote.reports, (x) => x.reportedAt, 90),
+      debriefs: byId(state.debriefs, remote.debriefs, (x) => x.createdAt, 200),
+    };
+  });
 }

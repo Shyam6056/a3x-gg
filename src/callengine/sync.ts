@@ -3,12 +3,14 @@
 import { supabase } from "@/integrations/supabase/client";
 import type { Json } from "@/integrations/supabase/types";
 import type { CallRecord } from "./types";
+import { ensureSession } from "@/lib/backend/ensure-session";
 
 export async function pushCallRecord(r: CallRecord): Promise<{ ok: boolean; error?: string }> {
-  const { data: auth } = await supabase.auth.getUser();
+  const uid = await ensureSession();
+  if (!uid) return { ok: false, error: "no session" };
   const row = {
     called_at: r.ts,
-    operator_id: auth.user?.id ?? null,
+    operator_id: uid,
     operator_name: r.operatorName ?? null,
     lead_ulid: r.ulid ?? null,
     canonical_id: r.canonicalId ?? null,
